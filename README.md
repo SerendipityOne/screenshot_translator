@@ -141,7 +141,14 @@ dist/
 
 ```text
 .
-├── app.py                       # PySide6 托盘、截图、OCR、翻译和设置窗口
+├── app.py                       # 兼容启动入口与公共符号导出
+├── screenshot_translator/       # 按职责拆分的应用代码
+│   ├── config.py                # 配置模型、校验与持久化
+│   ├── services.py              # OCR、翻译和图片编码
+│   ├── desktop.py               # XDG 自启动
+│   ├── hotkeys.py               # X11 全局快捷键
+│   ├── widgets.py               # 截图、结果和设置界面
+│   └── controller.py            # Qt 任务与应用生命周期
 ├── screenshot-translator.spec   # PyInstaller onedir 配置
 ├── build_app.sh                 # 构建应用目录和 tar.gz
 ├── run.sh                       # 独立程序优先、源码开发回退
