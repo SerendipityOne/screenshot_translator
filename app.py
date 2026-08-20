@@ -7,13 +7,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import asdict, dataclass
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-from PyQt6.QtCore import (
+from PySide6.QtCore import (
     QBuffer,
     QIODevice,
     QObject,
@@ -24,25 +25,28 @@ from PyQt6.QtCore import (
     Qt,
     QThread,
     QTimer,
-    pyqtSignal,
+    Signal,
 )
-from PyQt6.QtGui import (
+from PySide6.QtGui import (
     QAction,
     QColor,
     QCloseEvent,
     QCursor,
     QKeyEvent,
+    QKeySequence,
     QMouseEvent,
     QPainter,
     QPen,
     QPixmap,
     QResizeEvent,
 )
-from PyQt6.QtWidgets import (
+from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QKeySequenceEdit,
     QLabel,
     QLineEdit,
     QMenu,
@@ -51,6 +55,7 @@ from PyQt6.QtWidgets import (
     QSplitter,
     QStyle,
     QSystemTrayIcon,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -64,6 +69,9 @@ OCR_TIMEOUT_SECONDS = 30
 API_TIMEOUT_SECONDS = 60
 MAX_API_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_SOURCE_CHARACTERS = 100_000
+DEFAULT_TRANSLATE_HOTKEY = "Ctrl+Alt+Q"
+DEFAULT_OCR_HOTKEY = "Ctrl+Alt+W"
+AUTOSTART_FILENAME = "screenshot-translator.desktop"
 
 LOGGER = logging.getLogger(APP_NAME)
 
@@ -112,6 +120,102 @@ class ApiConfig:
         return config
 
 
+@dataclass(frozen=True)
+class HotkeySpec:
+    portable_text: str
+    keysym_name: str
+    modifiers: int
+
+
+def parse_hotkey(value: str, label: str) -> HotkeySpec:
+    sequence = QKeySequence(value.strip(), QKeySequence.SequenceFormat.PortableText)
+    portable_text = sequence.toString(QKeySequence.SequenceFormat.PortableText)
+    if sequence.count() != 1 or not portable_text:
+        raise ConfigError(f"{label}必须是单段快捷键。")
+
+    combination = sequence[0]
+    modifier_value = int(combination.keyboardModifiers().value)
+    control = int(Qt.KeyboardModifier.ControlModifier.value)
+    alt = int(Qt.KeyboardModifier.AltModifier.value)
+    shift = int(Qt.KeyboardModifier.ShiftModifier.value)
+    meta = int(Qt.KeyboardModifier.MetaModifier.value)
+    allowed_modifiers = control | alt | shift | meta
+    if modifier_value & ~allowed_modifiers:
+        raise ConfigError(f"{label}包含不支持的修饰键。")
+    if not modifier_value & (control | alt | meta):
+        raise ConfigError(f"{label}至少需要 Ctrl、Alt 或 Super。")
+
+    key = int(combination.key())
+    if int(Qt.Key.Key_A) <= key <= int(Qt.Key.Key_Z):
+        keysym_name = chr(key)
+    elif int(Qt.Key.Key_0) <= key <= int(Qt.Key.Key_9):
+        keysym_name = chr(key)
+    elif int(Qt.Key.Key_F1) <= key <= int(Qt.Key.Key_F12):
+        keysym_name = f"F{key - int(Qt.Key.Key_F1) + 1}"
+    else:
+        raise ConfigError(f"{label}主键只支持字母、数字或 F1-F12。")
+
+    x_modifiers = 0
+    if modifier_value & control:
+        x_modifiers |= X.ControlMask
+    if modifier_value & alt:
+        x_modifiers |= X.Mod1Mask
+    if modifier_value & shift:
+        x_modifiers |= X.ShiftMask
+    if modifier_value & meta:
+        x_modifiers |= X.Mod4Mask
+    return HotkeySpec(portable_text, keysym_name, x_modifiers)
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    api: ApiConfig = field(default_factory=ApiConfig)
+    translate_hotkey: str = DEFAULT_TRANSLATE_HOTKEY
+    ocr_hotkey: str = DEFAULT_OCR_HOTKEY
+
+    def validated(self, require_api: bool = False) -> "AppConfig":
+        api = ApiConfig(
+            api_url=self.api.api_url.strip(),
+            model=self.api.model.strip(),
+            api_key=self.api.api_key.strip(),
+        )
+        api_values = (api.api_url, api.model, api.api_key)
+        if require_api or any(api_values):
+            if not all(api_values):
+                raise ConfigError(
+                    "翻译接口的 API URL、模型和 API Key 必须全部填写。"
+                )
+            api = api.validated()
+
+        translate = parse_hotkey(self.translate_hotkey, "截图翻译快捷键")
+        ocr = parse_hotkey(self.ocr_hotkey, "截图 OCR 快捷键")
+        if translate.portable_text == ocr.portable_text:
+            raise ConfigError("截图翻译和截图 OCR 不能使用相同快捷键。")
+        return AppConfig(api, translate.portable_text, ocr.portable_text)
+
+
+def write_private_atomic(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}-", dir=path.parent
+    )
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as output:
+            os.fchmod(output.fileno(), 0o600)
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_name, path)
+        os.chmod(path, 0o600)
+    except Exception:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 class ConfigStore:
     def __init__(self, path: Path):
         self.path = path
@@ -125,49 +229,118 @@ class ConfigStore:
         )
         return cls(config_dir / "config.json")
 
-    def load(self) -> ApiConfig:
+    def load(self) -> AppConfig:
         if not self.path.exists():
-            return ApiConfig()
+            return AppConfig()
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 raise TypeError("配置根节点不是对象")
-            config = ApiConfig(
-                api_url=str(data.get("api_url", "")),
-                model=str(data.get("model", "")),
-                api_key=str(data.get("api_key", "")),
-            )
+            # 旧版本只保存 API 字段；缺少快捷键时必须继续使用原默认值。
+            config = AppConfig(
+                api=ApiConfig(
+                    api_url=str(data.get("api_url", "")),
+                    model=str(data.get("model", "")),
+                    api_key=str(data.get("api_key", "")),
+                ),
+                translate_hotkey=str(
+                    data.get("translate_hotkey", DEFAULT_TRANSLATE_HOTKEY)
+                ),
+                ocr_hotkey=str(data.get("ocr_hotkey", DEFAULT_OCR_HOTKEY)),
+            ).validated()
             os.chmod(self.path, 0o600)
             return config
         except (OSError, TypeError, ValueError) as exc:
-            raise ConfigError(f"无法读取 API 配置：{exc}") from exc
+            raise ConfigError(f"无法读取设置：{exc}") from exc
 
-    def save(self, config: ApiConfig) -> None:
+    def save(self, config: AppConfig) -> None:
         config = config.validated()
+        payload = asdict(config.api)
+        payload.update(
+            {
+                "translate_hotkey": config.translate_hotkey,
+                "ocr_hotkey": config.ocr_hotkey,
+            }
+        )
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            os.chmod(self.path.parent, 0o700)
-            file_descriptor, temporary_name = tempfile.mkstemp(
-                prefix=".config-", suffix=".json", dir=self.path.parent
-            )
-            try:
-                with os.fdopen(file_descriptor, "w", encoding="utf-8") as output:
-                    os.fchmod(output.fileno(), 0o600)
-                    json.dump(asdict(config), output, ensure_ascii=False, indent=2)
-                    output.write("\n")
-                    output.flush()
-                    os.fsync(output.fileno())
-                os.replace(temporary_name, self.path)
-                os.chmod(self.path, 0o600)
-            except Exception:
-                try:
-                    os.unlink(temporary_name)
-                except FileNotFoundError:
-                    pass
-                raise
-            LOGGER.info("API 配置已保存 path=%s", self.path)
+            content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+            write_private_atomic(self.path, content)
+            LOGGER.info("设置已保存 path=%s", self.path)
         except OSError as exc:
-            raise ConfigError(f"无法保存 API 配置：{exc}") from exc
+            raise ConfigError(f"无法保存设置：{exc}") from exc
+
+
+def quote_desktop_exec_argument(value: str) -> str:
+    if "\n" in value or "\r" in value:
+        raise ConfigError("自启动命令路径无效。")
+    escaped = value.replace("\\", "\\\\")
+    for character in ('"', "`", "$"):
+        escaped = escaped.replace(character, f"\\{character}")
+    return f'"{escaped}"'
+
+
+class AutostartManager:
+    def __init__(
+        self,
+        entry_path: Path,
+        launch_command: tuple[str, ...],
+    ) -> None:
+        self.entry_path = entry_path
+        self.launch_command = launch_command
+
+    @classmethod
+    def from_standard_location(cls) -> "AutostartManager":
+        config_root = Path(
+            QStandardPaths.writableLocation(
+                QStandardPaths.StandardLocation.GenericConfigLocation
+            )
+        )
+        if getattr(sys, "frozen", False):
+            launch_command = (str(Path(sys.executable).resolve()),)
+        else:
+            # GNOME 自启动不经过交互 Shell，直接使用当前解释器即可，无需 conda init。
+            launch_command = (
+                str(Path(sys.executable).resolve()),
+                str(Path(__file__).resolve()),
+            )
+        return cls(
+            config_root / "autostart" / AUTOSTART_FILENAME,
+            launch_command,
+        )
+
+    def is_enabled(self) -> bool:
+        return self.entry_path.is_file()
+
+    def set_enabled(self, enabled: bool) -> None:
+        try:
+            if not enabled:
+                self.entry_path.unlink(missing_ok=True)
+                LOGGER.info("登录自启动已关闭 path=%s", self.entry_path)
+                return
+            content = self._desktop_entry()
+            write_private_atomic(self.entry_path, content)
+            LOGGER.info("登录自启动已开启 path=%s", self.entry_path)
+        except OSError as exc:
+            raise ConfigError(f"无法更新登录自启动：{exc}") from exc
+
+    def _desktop_entry(self) -> str:
+        if not self.launch_command or not os.access(self.launch_command[0], os.X_OK):
+            raise ConfigError("无法执行当前程序，不能启用登录自启动。")
+        command = " ".join(
+            quote_desktop_exec_argument(argument)
+            for argument in self.launch_command
+        )
+        return (
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Version=1.0\n"
+            "Name=Screenshot Translator\n"
+            "Comment=截图翻译与 OCR\n"
+            f"Exec={command}\n"
+            "Terminal=false\n"
+            "OnlyShowIn=GNOME;\n"
+            "X-GNOME-Autostart-enabled=true\n"
+        )
 
 
 def build_translation_payload(model: str, source_text: str) -> dict[str, object]:
@@ -309,8 +482,8 @@ def image_to_png_bytes(image: object) -> bytes:
 
 
 class ProcessingThread(QThread):
-    succeeded = pyqtSignal(str)
-    failed = pyqtSignal(str)
+    succeeded = Signal(str)
+    failed = Signal(str)
 
     def __init__(self, mode: str, png_bytes: bytes, config: ApiConfig | None):
         super().__init__()
@@ -410,53 +583,105 @@ class ResultWindow(QWidget):
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, store: ConfigStore, config: ApiConfig, parent: QWidget | None = None):
+    def __init__(
+        self,
+        config: AppConfig,
+        autostart_enabled: bool,
+        apply_settings: Callable[[AppConfig, bool], None],
+        require_api: bool = False,
+        initial_tab: int = 0,
+        parent: QWidget | None = None,
+    ):
         super().__init__(parent)
-        self.store = store
-        self.saved_config: ApiConfig | None = None
-        self.setWindowTitle("翻译 API 设置")
-        self.setMinimumWidth(560)
+        self.apply_settings = apply_settings
+        self.require_api = require_api
+        self.saved_config: AppConfig | None = None
+        self.setWindowTitle("设置")
+        self.setMinimumSize(620, 360)
 
-        self.api_url = QLineEdit(config.api_url)
+        self.autostart = QCheckBox("登录 GNOME 后自动启动（仅 X11）")
+        self.autostart.setChecked(autostart_enabled)
+        self.translate_hotkey = QKeySequenceEdit()
+        self.translate_hotkey.setMaximumSequenceLength(1)
+        self.translate_hotkey.setKeySequence(QKeySequence(config.translate_hotkey))
+        self.ocr_hotkey = QKeySequenceEdit()
+        self.ocr_hotkey.setMaximumSequenceLength(1)
+        self.ocr_hotkey.setKeySequence(QKeySequence(config.ocr_hotkey))
+
+        general_notice = QLabel(
+            "快捷键必须包含 Ctrl、Alt 或 Super；Shift 可附加，"
+            "主键支持字母、数字和 F1-F12。"
+        )
+        general_notice.setWordWrap(True)
+        general_form = QFormLayout()
+        general_form.addRow("截图翻译快捷键：", self.translate_hotkey)
+        general_form.addRow("截图 OCR 快捷键：", self.ocr_hotkey)
+        general_tab = QWidget()
+        general_layout = QVBoxLayout(general_tab)
+        general_layout.addWidget(self.autostart)
+        general_layout.addLayout(general_form)
+        general_layout.addWidget(general_notice)
+        general_layout.addStretch()
+
+        self.api_url = QLineEdit(config.api.api_url)
         self.api_url.setPlaceholderText("https://example.com/v1/chat/completions")
-        self.model = QLineEdit(config.model)
+        self.model = QLineEdit(config.api.model)
         self.model.setPlaceholderText("模型名称")
-        self.api_key = QLineEdit(config.api_key)
+        self.api_key = QLineEdit(config.api.api_key)
         self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.api_key.setPlaceholderText("API Key")
 
-        notice = QLabel(
+        api_notice = QLabel(
             "API Key 将以 0600 权限明文保存在当前用户配置目录；"
             "截图原图不会上传，只有 OCR 文本会发送到此接口。"
         )
-        notice.setWordWrap(True)
+        api_notice.setWordWrap(True)
 
-        form = QFormLayout()
-        form.addRow("完整 API URL：", self.api_url)
-        form.addRow("模型：", self.model)
-        form.addRow("API Key：", self.api_key)
+        api_form = QFormLayout()
+        api_form.addRow("完整 API URL：", self.api_url)
+        api_form.addRow("模型：", self.model)
+        api_form.addRow("API Key：", self.api_key)
+        api_tab = QWidget()
+        api_layout = QVBoxLayout(api_tab)
+        api_layout.addLayout(api_form)
+        api_layout.addWidget(api_notice)
+        api_layout.addStretch()
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(general_tab, "通用设置")
+        self.tabs.addTab(api_tab, "翻译接口设置")
+        self.tabs.setCurrentIndex(1 if initial_tab == 1 else 0)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save
             | QDialogButtonBox.StandardButton.Cancel
         )
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
         buttons.accepted.connect(self._save)
         buttons.rejected.connect(self.reject)
 
         layout = QVBoxLayout(self)
-        layout.addLayout(form)
-        layout.addWidget(notice)
+        layout.addWidget(self.tabs)
         layout.addWidget(buttons)
 
     def _save(self) -> None:
         try:
-            config = ApiConfig(
-                api_url=self.api_url.text(),
-                model=self.model.text(),
-                api_key=self.api_key.text(),
-            ).validated()
-            self.store.save(config)
-        except ConfigError as exc:
+            config = AppConfig(
+                api=ApiConfig(
+                    api_url=self.api_url.text(),
+                    model=self.model.text(),
+                    api_key=self.api_key.text(),
+                ),
+                translate_hotkey=self.translate_hotkey.keySequence().toString(
+                    QKeySequence.SequenceFormat.PortableText
+                ),
+                ocr_hotkey=self.ocr_hotkey.keySequence().toString(
+                    QKeySequence.SequenceFormat.PortableText
+                ),
+            ).validated(require_api=self.require_api)
+            self.apply_settings(config, self.autostart.isChecked())
+        except (ConfigError, RuntimeError) as exc:
             QMessageBox.warning(self, "配置无效", str(exc))
             return
         self.saved_config = config
@@ -464,8 +689,8 @@ class SettingsDialog(QDialog):
 
 
 class ScreenshotOverlay(QWidget):
-    selected = pyqtSignal(QPixmap)
-    canceled = pyqtSignal()
+    selected = Signal(QPixmap)
+    canceled = Signal()
 
     def __init__(self, screenshot: QPixmap, screen_geometry: QRect):
         super().__init__(
@@ -563,20 +788,25 @@ class ScreenshotOverlay(QWidget):
 
 
 class GlobalHotkeys(QObject):
-    translate_requested = pyqtSignal()
-    ocr_requested = pyqtSignal()
+    translate_requested = Signal()
+    ocr_requested = Signal()
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        translate_hotkey: str = DEFAULT_TRANSLATE_HOTKEY,
+        ocr_hotkey: str = DEFAULT_OCR_HOTKEY,
+    ) -> None:
         super().__init__()
         self._display = display.Display()
         self._root = self._display.screen().root
-        self._registrations: list[tuple[int, int]] = []
+        self._registrations: set[tuple[int, int]] = set()
+        self._event_modes: dict[tuple[int, int], str] = {}
         self._num_lock_mask = self._find_num_lock_mask()
-        self._keycodes = {
-            self._display.keysym_to_keycode(XK.string_to_keysym("q")): "translate",
-            self._display.keysym_to_keycode(XK.string_to_keysym("w")): "ocr",
-        }
-        self._register()
+        try:
+            self.reconfigure(translate_hotkey, ocr_hotkey)
+        except Exception:
+            self.close()
+            raise
         self._notifier = QSocketNotifier(
             self._display.fileno(), QSocketNotifier.Type.Read, self
         )
@@ -589,46 +819,74 @@ class GlobalHotkeys(QObject):
                 return 1 << index
         return 0
 
-    def _register(self) -> None:
-        base_modifiers = X.ControlMask | X.Mod1Mask
+    def _build_registration_state(
+        self, translate_hotkey: str, ocr_hotkey: str
+    ) -> tuple[set[tuple[int, int]], dict[tuple[int, int], str]]:
+        translate = parse_hotkey(translate_hotkey, "截图翻译快捷键")
+        ocr = parse_hotkey(ocr_hotkey, "截图 OCR 快捷键")
+        if translate.portable_text == ocr.portable_text:
+            raise ConfigError("截图翻译和截图 OCR 不能使用相同快捷键。")
+
         ignored_variants = {
             0,
             X.LockMask,
             self._num_lock_mask,
             X.LockMask | self._num_lock_mask,
         }
+        registrations: set[tuple[int, int]] = set()
+        event_modes: dict[tuple[int, int], str] = {}
+        for mode, hotkey in (("translate", translate), ("ocr", ocr)):
+            keysym = XK.string_to_keysym(hotkey.keysym_name)
+            keycode = self._display.keysym_to_keycode(keysym)
+            if not keycode:
+                raise ConfigError(
+                    f"当前键盘布局无法使用快捷键 {hotkey.portable_text}。"
+                )
+            event_modes[(keycode, hotkey.modifiers)] = mode
+            for ignored in ignored_variants:
+                registrations.add((keycode, hotkey.modifiers | ignored))
+        return registrations, event_modes
+
+    def reconfigure(self, translate_hotkey: str, ocr_hotkey: str) -> None:
+        registrations, event_modes = self._build_registration_state(
+            translate_hotkey, ocr_hotkey
+        )
+        # 先保留旧注册并尝试新增项；只有全部成功后才释放废弃项。
+        additions = registrations - self._registrations
         grab_errors: list[object] = []
 
         def collect_error(error: object, _request: object) -> None:
             grab_errors.append(error)
 
-        for keycode in self._keycodes:
-            for ignored in ignored_variants:
-                modifiers = base_modifiers | ignored
-                self._root.grab_key(
-                    keycode,
-                    modifiers,
-                    False,
-                    X.GrabModeAsync,
-                    X.GrabModeAsync,
-                    onerror=collect_error,
-                )
-                self._registrations.append((keycode, modifiers))
+        for keycode, modifiers in additions:
+            self._root.grab_key(
+                keycode,
+                modifiers,
+                False,
+                X.GrabModeAsync,
+                X.GrabModeAsync,
+                onerror=collect_error,
+            )
         self._display.sync()
         if grab_errors:
-            self.close()
+            for keycode, modifiers in additions:
+                self._root.ungrab_key(keycode, modifiers)
+            self._display.sync()
             raise RuntimeError("无法注册全局快捷键，可能已被其他程序占用。")
 
+        for keycode, modifiers in self._registrations - registrations:
+            self._root.ungrab_key(keycode, modifiers)
+        self._display.sync()
+        self._registrations = registrations
+        self._event_modes = event_modes
+
     def _drain_events(self, *_args: object) -> None:
-        base_modifiers = X.ControlMask | X.Mod1Mask
         while self._display.pending_events():
             event = self._display.next_event()
             if event.type != X.KeyPress:
                 continue
             normalized_state = event.state & ~(X.LockMask | self._num_lock_mask)
-            if normalized_state != base_modifiers:
-                continue
-            mode = self._keycodes.get(event.detail)
+            mode = self._event_modes.get((event.detail, normalized_state))
             if mode == "translate":
                 self.translate_requested.emit()
             elif mode == "ocr":
@@ -655,8 +913,12 @@ class ScreenshotTranslatorApp(QObject):
         super().__init__()
         self.qt_app = qt_app
         self.config_store = ConfigStore.from_standard_location()
+        self.autostart_manager = AutostartManager.from_standard_location()
+        self.settings = AppConfig()
         self.result_window = ResultWindow()
         self.tray: QSystemTrayIcon | None = None
+        self.translate_action: QAction | None = None
+        self.ocr_action: QAction | None = None
         self.hotkeys: GlobalHotkeys | None = None
         self.overlay: ScreenshotOverlay | None = None
         self.worker: ProcessingThread | None = None
@@ -675,8 +937,20 @@ class ScreenshotTranslatorApp(QObject):
             )
             return False
         try:
+            self.settings = self.config_store.load()
+        except ConfigError as exc:
+            QMessageBox.warning(
+                None,
+                "设置读取失败",
+                f"{exc}\n\n本次启动将使用默认设置，"
+                "可在托盘菜单中重新保存。",
+            )
+            self.settings = AppConfig()
+        try:
             check_tesseract_languages()
-            self.hotkeys = GlobalHotkeys()
+            self.hotkeys = GlobalHotkeys(
+                self.settings.translate_hotkey, self.settings.ocr_hotkey
+            )
         except Exception as exc:
             LOGGER.exception("启动前置检查失败")
             self._critical("启动失败", str(exc))
@@ -684,16 +958,19 @@ class ScreenshotTranslatorApp(QObject):
 
         icon = self.qt_app.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
         menu = QMenu()
-        translate_action = QAction("截图翻译（Ctrl+Alt+Q）", menu)
-        ocr_action = QAction("截图 OCR（Ctrl+Alt+W）", menu)
-        settings_action = QAction("翻译 API 设置", menu)
+        self.translate_action = QAction(menu)
+        self.ocr_action = QAction(menu)
+        self._update_action_labels()
+        settings_action = QAction("设置…", menu)
         quit_action = QAction("退出", menu)
-        translate_action.triggered.connect(lambda: self.request_capture("translate"))
-        ocr_action.triggered.connect(lambda: self.request_capture("ocr"))
-        settings_action.triggered.connect(self.open_settings)
+        self.translate_action.triggered.connect(
+            lambda: self.request_capture("translate")
+        )
+        self.ocr_action.triggered.connect(lambda: self.request_capture("ocr"))
+        settings_action.triggered.connect(lambda: self.open_settings())
         quit_action.triggered.connect(self.request_quit)
-        menu.addAction(translate_action)
-        menu.addAction(ocr_action)
+        menu.addAction(self.translate_action)
+        menu.addAction(self.ocr_action)
         menu.addSeparator()
         menu.addAction(settings_action)
         menu.addSeparator()
@@ -709,19 +986,79 @@ class ScreenshotTranslatorApp(QObject):
         )
         self.hotkeys.ocr_requested.connect(lambda: self.request_capture("ocr"))
         self.qt_app.aboutToQuit.connect(self.shutdown)
-        LOGGER.info("程序已启动 hotkeys=Ctrl+Alt+Q,Ctrl+Alt+W")
+        LOGGER.info(
+            "程序已启动 hotkeys=%s,%s",
+            self.settings.translate_hotkey,
+            self.settings.ocr_hotkey,
+        )
         return True
 
-    def open_settings(self) -> ApiConfig | None:
-        try:
-            current = self.config_store.load()
-        except ConfigError as exc:
-            QMessageBox.warning(None, "配置读取失败", str(exc))
-            current = ApiConfig()
-        dialog = SettingsDialog(self.config_store, current, self.result_window)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            return dialog.saved_config
+    def open_settings(
+        self, initial_tab: int = 0, require_api: bool = False
+    ) -> ApiConfig | None:
+        dialog = SettingsDialog(
+            self.settings,
+            self.autostart_manager.is_enabled(),
+            self._apply_settings,
+            require_api=require_api,
+            initial_tab=initial_tab,
+            parent=self.result_window,
+        )
+        if (
+            dialog.exec() == QDialog.DialogCode.Accepted
+            and dialog.saved_config is not None
+        ):
+            return dialog.saved_config.api
         return None
+
+    def _apply_settings(self, config: AppConfig, autostart_enabled: bool) -> None:
+        old_config = self.settings
+        old_autostart = self.autostart_manager.is_enabled()
+        # 配置文件最后原子落盘；前面的运行时状态失败时均恢复旧值。
+        try:
+            if self.hotkeys is not None:
+                self.hotkeys.reconfigure(
+                    config.translate_hotkey, config.ocr_hotkey
+                )
+            self.autostart_manager.set_enabled(autostart_enabled)
+            self.config_store.save(config)
+        except Exception as exc:
+            LOGGER.warning("设置应用失败，准备恢复旧设置 error=%s", exc)
+            rollback_errors: list[str] = []
+            try:
+                self.autostart_manager.set_enabled(old_autostart)
+            except Exception as rollback_exc:
+                rollback_errors.append(f"自启动：{rollback_exc}")
+            try:
+                if self.hotkeys is not None:
+                    self.hotkeys.reconfigure(
+                        old_config.translate_hotkey, old_config.ocr_hotkey
+                    )
+            except Exception as rollback_exc:
+                rollback_errors.append(f"快捷键：{rollback_exc}")
+            if rollback_errors:
+                LOGGER.exception("设置保存失败且回滚不完整")
+                raise ConfigError(
+                    f"{exc}；恢复旧设置失败：{'；'.join(rollback_errors)}"
+                ) from exc
+            raise
+
+        self.settings = config
+        self._update_action_labels()
+        LOGGER.info(
+            "通用设置已应用 hotkeys=%s,%s autostart=%s",
+            config.translate_hotkey,
+            config.ocr_hotkey,
+            autostart_enabled,
+        )
+
+    def _update_action_labels(self) -> None:
+        if self.translate_action is not None:
+            self.translate_action.setText(
+                f"截图翻译（{self.settings.translate_hotkey}）"
+            )
+        if self.ocr_action is not None:
+            self.ocr_action.setText(f"截图 OCR（{self.settings.ocr_hotkey}）")
 
     def request_capture(self, mode: str) -> None:
         if self.is_busy:
@@ -730,9 +1067,9 @@ class ScreenshotTranslatorApp(QObject):
         config: ApiConfig | None = None
         if mode == "translate":
             try:
-                config = self.config_store.load().validated()
+                config = self.settings.api.validated()
             except ConfigError:
-                config = self.open_settings()
+                config = self.open_settings(initial_tab=1, require_api=True)
                 if config is None:
                     return
 

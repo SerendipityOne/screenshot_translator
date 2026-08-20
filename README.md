@@ -1,6 +1,82 @@
+<div align="center">
+
 # Screenshot Translator
 
-Ubuntu X11 下的 PyQt6 托盘工具：区域截图后执行 OCR，或继续通过 OpenAI Chat Completions 兼容接口翻译为简体中文。
+**Ubuntu X11 下无需 Python/Conda 的截图翻译与 OCR 托盘工具**
+
+按下快捷键框选屏幕区域；左侧保留截图，右侧显示 OCR 文本或简体中文译文。
+
+[快速开始](#快速开始) · [使用方式](#使用方式) · [自行构建](#自行构建) · [许可证](#许可证)
+
+</div>
+
+![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
+![PySide6](https://img.shields.io/badge/GUI-PySide6-41CD52?logo=qt&logoColor=white)
+![Platform](https://img.shields.io/badge/Platform-Ubuntu%2024.04%20X11-E95420?logo=ubuntu&logoColor=white)
+
+## 功能概览
+
+| 模式 | 默认快捷键 | 处理链路 | 右侧输出 |
+| --- | --- | --- | --- |
+| 截图翻译 | `Ctrl+Alt+Q` | 框选截图 → Tesseract OCR → OpenAI-compatible API | 简体中文译文 |
+| 截图 OCR | `Ctrl+Alt+W` | 框选截图 → Tesseract OCR | OCR 原文 |
+
+- 只截取鼠标所在显示器，支持拖拽框选和 `Esc`/右键取消。
+- 结果窗口左右分栏，截图等比缩放，文本只读且可选择复制。
+- OCR 固定使用 `chi_sim+chi_tra+eng`；翻译时只发送 OCR 文本，截图原图不会上传。
+- 设置窗口支持自定义全局快捷键和登录 GNOME 后自动启动。
+- 同一时间只处理一个任务，不保存历史、不自动复制或保存截图。
+
+## 工作流
+
+```mermaid
+flowchart LR
+    hotkey["Ctrl+Alt+Q / Ctrl+Alt+W"] --> monitor["鼠标所在显示器"]
+    monitor --> select["拖拽框选区域"]
+    select --> ocr["Tesseract OCR<br/>chi_sim + chi_tra + eng"]
+    ocr --> mode{"任务模式"}
+    mode -->|截图 OCR| result["双栏结果窗口"]
+    mode -->|截图翻译| api["OpenAI-compatible API<br/>仅发送 OCR 文本"]
+    api --> result
+```
+
+## 快速开始
+
+发布包已包含 Python、PySide6、Qt 和所需动态库；运行时不需要安装或激活 Conda。
+
+### 1. 安装系统 OCR
+
+```bash
+sudo apt update
+sudo apt install -y \
+  tesseract-ocr \
+  tesseract-ocr-chi-sim \
+  tesseract-ocr-chi-tra \
+  tesseract-ocr-eng
+```
+
+如果托盘图标不可见，请启用 Ubuntu GNOME 的 AppIndicator 扩展：
+
+```bash
+gnome-extensions enable ubuntu-appindicators@ubuntu.com
+```
+
+### 2. 解压并运行
+
+```bash
+tar -xzf screenshot-translator-linux-x86_64.tar.gz
+cd screenshot-translator
+./screenshot-translator
+```
+
+发布目标固定为 Ubuntu 24.04 x86_64 GNOME X11。Linux 构建受 glibc 版本约束，不承诺兼容更旧发行版；当前不支持 Wayland 或 Windows。
+
+## 使用方式
+
+1. 启动程序并确认托盘图标出现。
+2. 按 `Ctrl+Alt+Q` 进入截图翻译，或按 `Ctrl+Alt+W` 进入截图 OCR。
+3. 在鼠标所在显示器拖拽框选文字；按 `Esc` 或右键取消。
+4. 截图完成后自动打开并复用结果窗口：
 
 ```text
 ┌──────────── 截图翻译 / 截图 OCR ────────────┐
@@ -11,69 +87,76 @@ Ubuntu X11 下的 PyQt6 托盘工具：区域截图后执行 OCR，或继续通�
 └────────────────────────────────────────────┘
 ```
 
-## 功能
+## 设置
 
-- `Ctrl+Alt+Q`：截取鼠标所在显示器的区域，OCR 后翻译为简体中文。
-- `Ctrl+Alt+W`：截取鼠标所在显示器的区域，只执行 OCR。
-- OCR 使用本机 Tesseract 的 `chi_sim+chi_tra+eng` 语言数据。
-- 截图原图始终保留在本机；翻译时只发送 OCR 文本。
+托盘菜单的“设置…”包含“通用设置”和“翻译接口设置”两个页签。
 
-## 环境要求
+### 通用设置
 
-- Ubuntu 24.04、GNOME X11；不支持 Wayland。
-- Tesseract 5，以及 `chi_sim`、`chi_tra`、`eng` 语言数据。
-- 已启用 GNOME AppIndicator 扩展：
+- 登录自启动使用 XDG Autostart。打包程序直接记录自身可执行文件，源码模式直接记录当前 Python 与 `app.py`，均不依赖 `conda init`。
+- 两个快捷键保存后立即生效；若新快捷键被占用，程序保留旧配置。
+- 快捷键必须包含 `Ctrl`、`Alt` 或 `Super`，可附加 `Shift`；主键支持字母、数字和 `F1`–`F12`。
+- 自启动文件位于 `~/.config/autostart/screenshot-translator.desktop`。
 
-```bash
-gnome-extensions enable ubuntu-appindicators@ubuntu.com
-```
+### 翻译接口设置
 
-## 安装
+| 配置项 | 说明 |
+| --- | --- |
+| API URL | 完整的 Chat Completions 风格地址，例如 `https://api.example.com/v1/chat/completions` |
+| 模型 | 服务端支持的模型名称 |
+| API Key | Bearer 密钥 |
 
-使用独立 Miniconda 环境：
+三项可以全部留空，但不能只填写一部分。翻译请求读取 `choices[0].message.content`，不绑定厂商 SDK。
 
-```bash
-cbase
-conda create -n screenshot-translator python=3.12 pip xcb-util-cursor -y \
-  --override-channels \
-  -c https://repo.anaconda.com/pkgs/main \
-  -c https://repo.anaconda.com/pkgs/r
-conda activate screenshot-translator
-python -m pip install -r requirements.txt
-```
+- 截图只在本机处理；API 请求只包含 OCR 文本。
+- API Key 保存于 Qt 用户配置目录，文件权限为 `0600`，日志不记录密钥。
+- 远程接口必须使用 HTTPS；HTTP 仅允许 localhost/回环地址。
 
-`xcb-util-cursor` 是 PyQt6 xcb 平台插件在 X11 下所需的 Conda 库。若本机 Conda 配置把 defaults 指向不可用镜像，上述 `--override-channels` 只对本次创建命令生效，不会修改配置。不要执行 `conda init`，本项目不会修改 Miniconda 的自动激活设置。
+## 自行构建
 
-## 运行
-
-```bash
-./run.sh
-```
-
-`run.sh` 会清理当前进程继承的 ROS Python/动态库路径，并设置 Conda Qt 库路径。程序启动后只显示托盘图标。托盘菜单提供截图翻译、截图 OCR、翻译 API 设置和退出。
-
-首次使用截图翻译时需填写：
-
-- 完整的 Chat Completions 兼容 API URL，例如 `https://example.com/v1/chat/completions`。
-- 模型名称。
-- API Key。
-
-API Key 以明文保存在当前用户的 Qt 应用配置目录，配置文件权限固定为 `0600`。程序拒绝远程 HTTP 接口，但允许 `localhost`、`127.0.0.1` 和 `::1` 的本机 HTTP 接口。
-
-## 测试
+构建依赖 Conda，但生成的 `onedir` 应用不依赖 Conda。项目不会运行 `conda init`。
 
 ```bash
 cbase
 conda activate screenshot-translator
-env -u PYTHONPATH -u PYTHONHOME \
-  LD_LIBRARY_PATH="$CONDA_PREFIX/lib" \
-  QT_QPA_PLATFORM=offscreen python -m unittest -v
+python -m pip install -r requirements-build.txt
+./build_app.sh
 ```
 
-自动测试覆盖配置校验与权限、Mock API 请求契约、Tesseract 语言检查和一次真实英文 OCR 冒烟测试。全局快捷键、托盘和双显示器截图需要在 X11 桌面中人工验证。
+生成物：
 
-## 当前边界
+```text
+dist/
+├── screenshot-translator/
+│   ├── screenshot-translator
+│   ├── _internal/
+│   ├── LICENSE
+│   └── THIRD_PARTY_NOTICES.md
+└── screenshot-translator-linux-x86_64.tar.gz
+```
 
-- 不支持 Wayland、Windows、跨显示器框选或开机启动。
-- 不保存截图或 OCR 历史，不自动复制结果。
-- 固定使用 `choices[0].message.content` 响应格式，不依赖特定厂商 SDK。
+仓库中的 `run.sh` 会优先运行已构建程序；未构建时才使用当前 Python 环境或源码开发环境回退，因此不要求 Shell 已执行 `conda init`。
+
+## 项目结构
+
+```text
+.
+├── app.py                       # PySide6 托盘、截图、OCR、翻译和设置窗口
+├── screenshot-translator.spec   # PyInstaller onedir 配置
+├── build_app.sh                 # 构建应用目录和 tar.gz
+├── run.sh                       # 独立程序优先、源码开发回退
+├── requirements.txt             # 运行依赖
+├── requirements-build.txt       # 构建依赖
+├── LICENSE                      # 项目 MIT License
+└── THIRD_PARTY_NOTICES.md       # 随包第三方许可证说明
+```
+
+## 当前限制
+
+- 仅支持 Ubuntu 24.04 x86_64 GNOME X11，不支持跨显示器框选。
+- OCR 语言固定为 `chi_sim+chi_tra+eng`，翻译目标固定为简体中文。
+- Tesseract 及语言数据由系统提供，不打进应用目录。
+
+## 许可证
+
+项目使用 [MIT License](LICENSE)，版权归 SerendipityOne 所有。PySide6、Qt、PyInstaller 等随包组件的许可信息见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。Qt/PySide6 按 LGPL 条款使用，动态库保持可替换。
