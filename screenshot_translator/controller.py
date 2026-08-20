@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QCursor, QPixmap
+from PySide6.QtGui import QAction, QClipboard, QCursor, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -26,7 +26,12 @@ from .services import (
     request_translation,
     run_ocr,
 )
-from .widgets import ResultWindow, ScreenshotOverlay, SettingsDialog
+from .widgets import (
+    ResultWindow,
+    ScreenshotOverlay,
+    SelectionTranslationPopup,
+    SettingsDialog,
+)
 
 
 LOGGER = logging.getLogger(APP_NAME)
@@ -67,6 +72,29 @@ class ProcessingThread(QThread):
             self.failed.emit(f"处理失败：{exc}")
 
 
+class SelectionTranslationThread(QThread):
+    succeeded = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, source_text: str, config: ApiConfig):
+        super().__init__()
+        self.source_text = source_text
+        self.config = config
+
+    def run(self) -> None:
+        try:
+            LOGGER.info("开始后台划词翻译 chars=%d", len(self.source_text))
+            if self.isInterruptionRequested():
+                return
+            self.succeeded.emit(request_translation(self.config, self.source_text))
+        except (ConfigError, TranslationError) as exc:
+            LOGGER.warning("划词翻译失败 error=%s", exc)
+            self.failed.emit(str(exc))
+        except Exception as exc:
+            LOGGER.exception("划词翻译发生未预期异常")
+            self.failed.emit(f"处理失败：{exc}")
+
+
 class ScreenshotTranslatorApp(QObject):
     def __init__(
         self,
@@ -81,12 +109,13 @@ class ScreenshotTranslatorApp(QObject):
         )
         self.settings = AppConfig()
         self.result_window = ResultWindow()
+        self.selection_popup = SelectionTranslationPopup()
         self.tray: QSystemTrayIcon | None = None
         self.translate_action: QAction | None = None
         self.ocr_action: QAction | None = None
         self.hotkeys: GlobalHotkeys | None = None
         self.overlay: ScreenshotOverlay | None = None
-        self.worker: ProcessingThread | None = None
+        self.worker: QThread | None = None
         self.is_busy = False
         self.was_result_visible = False
         self.should_quit_after_work = False
@@ -114,7 +143,9 @@ class ScreenshotTranslatorApp(QObject):
         try:
             check_tesseract_languages()
             self.hotkeys = GlobalHotkeys(
-                self.settings.translate_hotkey, self.settings.ocr_hotkey
+                self.settings.translate_hotkey,
+                self.settings.ocr_hotkey,
+                self.settings.selection_translate_hotkey,
             )
         except Exception as exc:
             LOGGER.exception("启动前置检查失败")
@@ -150,11 +181,15 @@ class ScreenshotTranslatorApp(QObject):
             lambda: self.request_capture("translate")
         )
         self.hotkeys.ocr_requested.connect(lambda: self.request_capture("ocr"))
+        self.hotkeys.selection_translate_requested.connect(
+            self.request_selection_translation
+        )
         self.qt_app.aboutToQuit.connect(self.shutdown)
         LOGGER.info(
-            "程序已启动 hotkeys=%s,%s",
+            "程序已启动 hotkeys=%s,%s,%s",
             self.settings.translate_hotkey,
             self.settings.ocr_hotkey,
+            self.settings.selection_translate_hotkey,
         )
         return True
 
@@ -183,7 +218,9 @@ class ScreenshotTranslatorApp(QObject):
         try:
             if self.hotkeys is not None:
                 self.hotkeys.reconfigure(
-                    config.translate_hotkey, config.ocr_hotkey
+                    config.translate_hotkey,
+                    config.ocr_hotkey,
+                    config.selection_translate_hotkey,
                 )
             self.autostart_manager.set_enabled(autostart_enabled)
             self.config_store.save(config)
@@ -197,7 +234,9 @@ class ScreenshotTranslatorApp(QObject):
             try:
                 if self.hotkeys is not None:
                     self.hotkeys.reconfigure(
-                        old_config.translate_hotkey, old_config.ocr_hotkey
+                        old_config.translate_hotkey,
+                        old_config.ocr_hotkey,
+                        old_config.selection_translate_hotkey,
                     )
             except Exception as rollback_exc:
                 rollback_errors.append(f"快捷键：{rollback_exc}")
@@ -211,9 +250,10 @@ class ScreenshotTranslatorApp(QObject):
         self.settings = config
         self._update_action_labels()
         LOGGER.info(
-            "通用设置已应用 hotkeys=%s,%s autostart=%s",
+            "通用设置已应用 hotkeys=%s,%s,%s autostart=%s",
             config.translate_hotkey,
             config.ocr_hotkey,
+            config.selection_translate_hotkey,
             autostart_enabled,
         )
 
@@ -243,6 +283,41 @@ class ScreenshotTranslatorApp(QObject):
         self.result_window.hide()
         LOGGER.info("准备截图 mode=%s", mode)
         QTimer.singleShot(150, lambda: self._show_overlay(mode, config))
+
+    def request_selection_translation(self) -> None:
+        if self.is_busy:
+            self._notify("任务进行中", "请等待当前任务完成。")
+            return
+
+        anchor = QCursor.pos()
+        clipboard = QApplication.clipboard()
+        if clipboard is None or not clipboard.supportsSelection():
+            self.selection_popup.show_error_at(
+                anchor, "当前 X11 会话不支持 PRIMARY selection。"
+            )
+            return
+        source_text = clipboard.text(QClipboard.Mode.Selection).strip()
+        if not source_text:
+            self.selection_popup.show_error_at(
+                anchor, "未读取到选中文本，请先用鼠标选中文字。"
+            )
+            return
+
+        self.is_busy = True
+        try:
+            config = self.settings.api.validated()
+        except ConfigError:
+            config = self.open_settings(initial_tab=1, require_api=True)
+            if config is None:
+                self.is_busy = False
+                return
+
+        self.selection_popup.show_loading(anchor)
+        self.worker = SelectionTranslationThread(source_text, config)
+        self.worker.succeeded.connect(self.selection_popup.show_result)
+        self.worker.failed.connect(self.selection_popup.show_error)
+        self.worker.finished.connect(self._worker_finished)
+        self.worker.start()
 
     def _show_overlay(self, mode: str, config: ApiConfig | None) -> None:
         screen = QApplication.screenAt(QCursor.pos())
@@ -313,6 +388,7 @@ class ScreenshotTranslatorApp(QObject):
         self.qt_app.quit()
 
     def shutdown(self) -> None:
+        self.selection_popup.hide()
         if self.hotkeys is not None:
             self.hotkeys.close()
             self.hotkeys = None

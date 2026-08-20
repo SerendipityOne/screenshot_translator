@@ -15,10 +15,12 @@ from PySide6.QtGui import (
     QResizeEvent,
 )
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QHBoxLayout,
     QKeySequenceEdit,
     QLabel,
     QLineEdit,
@@ -26,6 +28,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QSplitter,
     QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -101,6 +104,94 @@ class ResultWindow(QWidget):
         self.hide()
 
 
+class SelectionTranslationPopup(QWidget):
+    """显示划词翻译状态；隐藏后复用同一个窗口实例。"""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(
+            parent,
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowStaysOnTopHint,
+        )
+        self.setWindowTitle("划词翻译")
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.resize(420, 240)
+        self.setMinimumSize(280, 120)
+
+        title = QLabel("划词翻译")
+        title.setStyleSheet("font-weight: 600;")
+        close_button = QToolButton()
+        close_button.setText("×")
+        close_button.setAutoRaise(True)
+        close_button.setToolTip("关闭")
+        close_button.clicked.connect(self.hide)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.addWidget(title)
+        header.addStretch()
+        header.addWidget(close_button)
+
+        self.text_output = QPlainTextEdit()
+        self.text_output.setReadOnly(True)
+        self.text_output.setPlaceholderText("翻译结果")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 10)
+        layout.addLayout(header)
+        layout.addWidget(self.text_output)
+
+    def show_loading(self, anchor: QPoint) -> None:
+        self.text_output.setPlainText("翻译中…")
+        self._show_at(anchor)
+
+    def show_error_at(self, anchor: QPoint, message: str) -> None:
+        self.text_output.setPlainText(f"处理失败\n\n{message}")
+        self._show_at(anchor)
+
+    def show_result(self, text: str) -> None:
+        if self.isVisible():
+            self.text_output.setPlainText(text)
+
+    def show_error(self, message: str) -> None:
+        if self.isVisible():
+            self.text_output.setPlainText(f"处理失败\n\n{message}")
+
+    def _show_at(self, anchor: QPoint) -> None:
+        screen = QApplication.screenAt(anchor) or QApplication.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            x = anchor.x() + 12
+            y = anchor.y() + 12
+            if x + self.width() > area.right() + 1:
+                x = anchor.x() - self.width() - 12
+            if y + self.height() > area.bottom() + 1:
+                y = anchor.y() - self.height() - 12
+            x = max(area.left(), min(x, area.right() - self.width() + 1))
+            y = max(area.top(), min(y, area.bottom() - self.height() + 1))
+            self.move(x, y)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() == Qt.Key.Key_Escape:
+            self.hide()
+            return
+        super().keyPressEvent(event)
+
+    def focusOutEvent(self, event: object) -> None:
+        super().focusOutEvent(event)
+        self.hide()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        event.ignore()
+        self.hide()
+
+
 class SettingsDialog(QDialog):
     def __init__(
         self,
@@ -126,6 +217,11 @@ class SettingsDialog(QDialog):
         self.ocr_hotkey = QKeySequenceEdit()
         self.ocr_hotkey.setMaximumSequenceLength(1)
         self.ocr_hotkey.setKeySequence(QKeySequence(config.ocr_hotkey))
+        self.selection_translate_hotkey = QKeySequenceEdit()
+        self.selection_translate_hotkey.setMaximumSequenceLength(1)
+        self.selection_translate_hotkey.setKeySequence(
+            QKeySequence(config.selection_translate_hotkey)
+        )
 
         general_notice = QLabel(
             "快捷键必须包含 Ctrl、Alt 或 Super；Shift 可附加，"
@@ -135,6 +231,7 @@ class SettingsDialog(QDialog):
         general_form = QFormLayout()
         general_form.addRow("截图翻译快捷键：", self.translate_hotkey)
         general_form.addRow("截图 OCR 快捷键：", self.ocr_hotkey)
+        general_form.addRow("划词翻译快捷键：", self.selection_translate_hotkey)
         general_tab = QWidget()
         general_layout = QVBoxLayout(general_tab)
         general_layout.addWidget(self.autostart)
@@ -152,7 +249,7 @@ class SettingsDialog(QDialog):
 
         api_notice = QLabel(
             "API Key 将以 0600 权限明文保存在当前用户配置目录；"
-            "截图原图不会上传，只有 OCR 文本会发送到此接口。"
+            "截图原图不会上传；截图翻译发送 OCR 文本，划词翻译发送 PRIMARY 选中文本。"
         )
         api_notice.setWordWrap(True)
 
@@ -196,6 +293,9 @@ class SettingsDialog(QDialog):
                     QKeySequence.SequenceFormat.PortableText
                 ),
                 ocr_hotkey=self.ocr_hotkey.keySequence().toString(
+                    QKeySequence.SequenceFormat.PortableText
+                ),
+                selection_translate_hotkey=self.selection_translate_hotkey.keySequence().toString(
                     QKeySequence.SequenceFormat.PortableText
                 ),
             ).validated(require_api=self.require_api)

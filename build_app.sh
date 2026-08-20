@@ -16,6 +16,12 @@ if [[ ! -f "$CONDA_PREFIX/lib/libxcb-cursor.so.0" ]]; then
   printf '错误：当前环境缺少 libxcb-cursor.so.0。\n' >&2
   exit 1
 fi
+for openssl_library in libssl.so.3 libcrypto.so.3; do
+  if [[ ! -f "$CONDA_PREFIX/lib/$openssl_library" ]]; then
+    printf '错误：当前环境缺少 %s。\n' "$openssl_library" >&2
+    exit 1
+  fi
+done
 
 unset PYTHONPATH PYTHONHOME LD_LIBRARY_PATH
 

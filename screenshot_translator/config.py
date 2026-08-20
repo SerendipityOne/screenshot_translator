@@ -22,6 +22,7 @@ MAX_API_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_SOURCE_CHARACTERS = 100_000
 DEFAULT_TRANSLATE_HOTKEY = "Ctrl+Alt+Q"
 DEFAULT_OCR_HOTKEY = "Ctrl+Alt+W"
+DEFAULT_SELECTION_TRANSLATE_HOTKEY = "Ctrl+Alt+E"
 AUTOSTART_FILENAME = "screenshot-translator.desktop"
 
 LOGGER = logging.getLogger(APP_NAME)
@@ -115,6 +116,7 @@ class AppConfig:
     api: ApiConfig = field(default_factory=ApiConfig)
     translate_hotkey: str = DEFAULT_TRANSLATE_HOTKEY
     ocr_hotkey: str = DEFAULT_OCR_HOTKEY
+    selection_translate_hotkey: str = DEFAULT_SELECTION_TRANSLATE_HOTKEY
 
     def validated(self, require_api: bool = False) -> "AppConfig":
         api = ApiConfig(
@@ -132,9 +134,22 @@ class AppConfig:
 
         translate = parse_hotkey(self.translate_hotkey, "截图翻译快捷键")
         ocr = parse_hotkey(self.ocr_hotkey, "截图 OCR 快捷键")
-        if translate.portable_text == ocr.portable_text:
-            raise ConfigError("截图翻译和截图 OCR 不能使用相同快捷键。")
-        return AppConfig(api, translate.portable_text, ocr.portable_text)
+        selection_translate = parse_hotkey(
+            self.selection_translate_hotkey, "划词翻译快捷键"
+        )
+        portable_hotkeys = {
+            translate.portable_text,
+            ocr.portable_text,
+            selection_translate.portable_text,
+        }
+        if len(portable_hotkeys) != 3:
+            raise ConfigError("截图翻译、截图 OCR 和划词翻译不能使用相同快捷键。")
+        return AppConfig(
+            api,
+            translate.portable_text,
+            ocr.portable_text,
+            selection_translate.portable_text,
+        )
 
 
 def write_private_atomic(path: Path, content: str) -> None:
@@ -190,6 +205,12 @@ class ConfigStore:
                     data.get("translate_hotkey", DEFAULT_TRANSLATE_HOTKEY)
                 ),
                 ocr_hotkey=str(data.get("ocr_hotkey", DEFAULT_OCR_HOTKEY)),
+                selection_translate_hotkey=str(
+                    data.get(
+                        "selection_translate_hotkey",
+                        DEFAULT_SELECTION_TRANSLATE_HOTKEY,
+                    )
+                ),
             ).validated()
             os.chmod(self.path, 0o600)
             return config
@@ -203,6 +224,7 @@ class ConfigStore:
             {
                 "translate_hotkey": config.translate_hotkey,
                 "ocr_hotkey": config.ocr_hotkey,
+                "selection_translate_hotkey": config.selection_translate_hotkey,
             }
         )
         try:

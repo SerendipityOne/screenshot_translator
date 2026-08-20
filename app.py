@@ -14,6 +14,7 @@ from screenshot_translator.config import (
     API_TIMEOUT_SECONDS,
     AUTOSTART_FILENAME,
     DEFAULT_OCR_HOTKEY,
+    DEFAULT_SELECTION_TRANSLATE_HOTKEY,
     DEFAULT_TRANSLATE_HOTKEY,
     MAX_API_RESPONSE_BYTES,
     MAX_SOURCE_CHARACTERS,
@@ -29,7 +30,11 @@ from screenshot_translator.config import (
     parse_hotkey,
     write_private_atomic,
 )
-from screenshot_translator.controller import ProcessingThread, ScreenshotTranslatorApp
+from screenshot_translator.controller import (
+    ProcessingThread,
+    ScreenshotTranslatorApp,
+    SelectionTranslationThread,
+)
 from screenshot_translator.desktop import (
     AutostartManager as _AutostartManager,
     quote_desktop_exec_argument,
@@ -49,6 +54,7 @@ from screenshot_translator.widgets import (
     ResultWindow,
     ScaledImageLabel,
     ScreenshotOverlay,
+    SelectionTranslationPopup,
     SettingsDialog,
 )
 

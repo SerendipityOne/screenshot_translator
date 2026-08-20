@@ -5,6 +5,7 @@ from Xlib import X, XK, display
 
 from .config import (
     DEFAULT_OCR_HOTKEY,
+    DEFAULT_SELECTION_TRANSLATE_HOTKEY,
     DEFAULT_TRANSLATE_HOTKEY,
     ConfigError,
     parse_hotkey,
@@ -14,11 +15,13 @@ from .config import (
 class GlobalHotkeys(QObject):
     translate_requested = Signal()
     ocr_requested = Signal()
+    selection_translate_requested = Signal()
 
     def __init__(
         self,
         translate_hotkey: str = DEFAULT_TRANSLATE_HOTKEY,
         ocr_hotkey: str = DEFAULT_OCR_HOTKEY,
+        selection_translate_hotkey: str = DEFAULT_SELECTION_TRANSLATE_HOTKEY,
     ) -> None:
         super().__init__()
         self._display = display.Display()
@@ -27,7 +30,9 @@ class GlobalHotkeys(QObject):
         self._event_modes: dict[tuple[int, int], str] = {}
         self._num_lock_mask = self._find_num_lock_mask()
         try:
-            self.reconfigure(translate_hotkey, ocr_hotkey)
+            self.reconfigure(
+                translate_hotkey, ocr_hotkey, selection_translate_hotkey
+            )
         except Exception:
             self.close()
             raise
@@ -44,12 +49,24 @@ class GlobalHotkeys(QObject):
         return 0
 
     def _build_registration_state(
-        self, translate_hotkey: str, ocr_hotkey: str
+        self,
+        translate_hotkey: str,
+        ocr_hotkey: str,
+        selection_translate_hotkey: str,
     ) -> tuple[set[tuple[int, int]], dict[tuple[int, int], str]]:
         translate = parse_hotkey(translate_hotkey, "截图翻译快捷键")
         ocr = parse_hotkey(ocr_hotkey, "截图 OCR 快捷键")
-        if translate.portable_text == ocr.portable_text:
-            raise ConfigError("截图翻译和截图 OCR 不能使用相同快捷键。")
+        selection_translate = parse_hotkey(
+            selection_translate_hotkey, "划词翻译快捷键"
+        )
+        if len(
+            {
+                translate.portable_text,
+                ocr.portable_text,
+                selection_translate.portable_text,
+            }
+        ) != 3:
+            raise ConfigError("截图翻译、截图 OCR 和划词翻译不能使用相同快捷键。")
 
         ignored_variants = {
             0,
@@ -59,7 +76,11 @@ class GlobalHotkeys(QObject):
         }
         registrations: set[tuple[int, int]] = set()
         event_modes: dict[tuple[int, int], str] = {}
-        for mode, hotkey in (("translate", translate), ("ocr", ocr)):
+        for mode, hotkey in (
+            ("translate", translate),
+            ("ocr", ocr),
+            ("selection_translate", selection_translate),
+        ):
             keysym = XK.string_to_keysym(hotkey.keysym_name)
             keycode = self._display.keysym_to_keycode(keysym)
             if not keycode:
@@ -71,9 +92,14 @@ class GlobalHotkeys(QObject):
                 registrations.add((keycode, hotkey.modifiers | ignored))
         return registrations, event_modes
 
-    def reconfigure(self, translate_hotkey: str, ocr_hotkey: str) -> None:
+    def reconfigure(
+        self,
+        translate_hotkey: str,
+        ocr_hotkey: str,
+        selection_translate_hotkey: str = DEFAULT_SELECTION_TRANSLATE_HOTKEY,
+    ) -> None:
         registrations, event_modes = self._build_registration_state(
-            translate_hotkey, ocr_hotkey
+            translate_hotkey, ocr_hotkey, selection_translate_hotkey
         )
         # 先保留旧注册并尝试新增项；只有全部成功后才释放废弃项。
         additions = registrations - self._registrations
@@ -115,6 +141,8 @@ class GlobalHotkeys(QObject):
                 self.translate_requested.emit()
             elif mode == "ocr":
                 self.ocr_requested.emit()
+            elif mode == "selection_translate":
+                self.selection_translate_requested.emit()
 
     def close(self) -> None:
         notifier = getattr(self, "_notifier", None)

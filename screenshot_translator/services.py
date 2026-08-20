@@ -97,6 +97,13 @@ def request_translation(config: ApiConfig, source_text: str) -> str:
     except HTTPError as exc:
         raise TranslationError(f"翻译 API 返回 HTTP {exc.code}。") from exc
     except URLError as exc:
+        if (
+            urlsplit(config.api_url).scheme == "https"
+            and "unknown url type" in str(exc.reason)
+        ):
+            raise TranslationError(
+                "当前运行环境缺少 HTTPS 支持，请重新构建应用并检查 OpenSSL 动态库。"
+            ) from exc
         raise TranslationError(f"无法连接翻译 API：{exc.reason}") from exc
     except TimeoutError as exc:
         raise TranslationError("翻译 API 请求超时。") from exc

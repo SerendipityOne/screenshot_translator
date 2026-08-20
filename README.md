@@ -20,11 +20,13 @@
 | --- | --- | --- | --- |
 | 截图翻译 | `Ctrl+Alt+Q` | 框选截图 → Tesseract OCR → OpenAI-compatible API | 简体中文译文 |
 | 截图 OCR | `Ctrl+Alt+W` | 框选截图 → Tesseract OCR | OCR 原文 |
+| 划词翻译 | `Ctrl+Alt+E` | X11 PRIMARY selection → OpenAI-compatible API | 鼠标附近简体中文浮窗 |
 
 - 只截取鼠标所在显示器，支持拖拽框选和 `Esc`/右键取消。
 - 结果窗口左右分栏，截图等比缩放，文本只读且可选择复制。
-- OCR 固定使用 `chi_sim+chi_tra+eng`；翻译时只发送 OCR 文本，截图原图不会上传。
-- 设置窗口支持自定义全局快捷键和登录 GNOME 后自动启动。
+- OCR 固定使用 `chi_sim+chi_tra+eng`；截图翻译只发送 OCR 文本，截图原图不会上传。
+- 设置窗口支持自定义三个全局快捷键和登录 GNOME 后自动启动。
+- 划词翻译只读取 X11 PRIMARY selection；选中文本会发送到翻译接口，常规剪贴板不会被读取或修改。
 - 同一时间只处理一个任务，不保存历史、不自动复制或保存截图。
 
 ## 工作流
@@ -38,6 +40,9 @@ flowchart LR
     mode -->|截图 OCR| result["双栏结果窗口"]
     mode -->|截图翻译| api["OpenAI-compatible API<br/>仅发送 OCR 文本"]
     api --> result
+    selection_hotkey["Ctrl+Alt+E"] --> primary["X11 PRIMARY selection"]
+    primary --> selection_api["OpenAI-compatible API<br/>仅发送选中文本"]
+    selection_api --> popup["鼠标附近翻译浮窗"]
 ```
 
 ## 快速开始
@@ -74,7 +79,7 @@ cd screenshot-translator
 ## 使用方式
 
 1. 启动程序并确认托盘图标出现。
-2. 按 `Ctrl+Alt+Q` 进入截图翻译，或按 `Ctrl+Alt+W` 进入截图 OCR。
+2. 按 `Ctrl+Alt+Q` 进入截图翻译，按 `Ctrl+Alt+W` 进入截图 OCR；在其他 X11 应用中选中文字后按 `Ctrl+Alt+E` 可划词翻译。
 3. 在鼠标所在显示器拖拽框选文字；按 `Esc` 或右键取消。
 4. 截图完成后自动打开并复用结果窗口：
 
@@ -87,6 +92,8 @@ cd screenshot-translator
 └────────────────────────────────────────────┘
 ```
 
+划词翻译会在按键时记录鼠标位置，在附近显示“翻译中…”及译文；浮窗可选择复制，按 `Esc`、关闭按钮或失去焦点即可隐藏。
+
 ## 设置
 
 托盘菜单的“设置…”包含“通用设置”和“翻译接口设置”两个页签。
@@ -94,7 +101,8 @@ cd screenshot-translator
 ### 通用设置
 
 - 登录自启动使用 XDG Autostart。打包程序直接记录自身可执行文件，源码模式直接记录当前 Python 与 `app.py`，均不依赖 `conda init`。
-- 两个快捷键保存后立即生效；若新快捷键被占用，程序保留旧配置。
+- 三个快捷键保存后立即生效；若新快捷键被占用，程序保留旧配置。
+- 默认划词翻译快捷键为 `Ctrl+Alt+E`，三个快捷键必须互不重复。
 - 快捷键必须包含 `Ctrl`、`Alt` 或 `Super`，可附加 `Shift`；主键支持字母、数字和 `F1`–`F12`。
 - 自启动文件位于 `~/.config/autostart/screenshot-translator.desktop`。
 
@@ -108,7 +116,7 @@ cd screenshot-translator
 
 三项可以全部留空，但不能只填写一部分。翻译请求读取 `choices[0].message.content`，不绑定厂商 SDK。
 
-- 截图只在本机处理；API 请求只包含 OCR 文本。
+- 截图只在本机处理；截图翻译只发送 OCR 文本，划词翻译只发送 X11 PRIMARY 选中文本。
 - API Key 保存于 Qt 用户配置目录，文件权限为 `0600`，日志不记录密钥。
 - 远程接口必须使用 HTTPS；HTTP 仅允许 localhost/回环地址。
 
