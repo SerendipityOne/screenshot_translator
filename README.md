@@ -100,11 +100,22 @@ cd screenshot-translator
 
 ### 通用设置
 
-- 登录自启动使用 XDG Autostart。打包程序直接记录自身可执行文件，源码模式直接记录当前 Python 与 `app.py`，均不依赖 `conda init`。
+- 登录自启动由 `systemd --user` 管理，在 GNOME X11 图形登录后启动；不启用 user linger，也不安装系统级 `/etc/systemd/system` 服务。
+- 独立应用启用后会安装或更新到 `~/.local/share/screenshot-translator/app`，服务启动前等待 8 秒，失败时自动重试并写入用户 journal。
+- 关闭自启动只禁用服务，固定应用副本会保留；源码开发模式不能启用自启动。
 - 三个快捷键保存后立即生效；若新快捷键被占用，程序保留旧配置。
 - 默认划词翻译快捷键为 `Ctrl+Alt+E`，三个快捷键必须互不重复。
 - 快捷键必须包含 `Ctrl`、`Alt` 或 `Super`，可附加 `Shift`；主键支持字母、数字和 `F1`–`F12`。
-- 自启动文件位于 `~/.config/autostart/screenshot-translator.desktop`。
+- 服务文件位于 `~/.config/systemd/user/screenshot-translator.service`。
+
+查看服务状态和日志：
+
+```bash
+systemctl --user status screenshot-translator.service
+systemctl --user enable screenshot-translator.service
+systemctl --user disable screenshot-translator.service
+journalctl --user -u screenshot-translator.service
+```
 
 ### 翻译接口设置
 
@@ -153,7 +164,7 @@ dist/
 ├── screenshot_translator/       # 按职责拆分的应用代码
 │   ├── config.py                # 配置模型、校验与持久化
 │   ├── services.py              # OCR、翻译和图片编码
-│   ├── desktop.py               # XDG 自启动
+│   ├── desktop.py               # systemd 用户服务与固定安装
 │   ├── hotkeys.py               # X11 全局快捷键
 │   ├── widgets.py               # 截图、结果和设置界面
 │   └── controller.py            # Qt 任务与应用生命周期

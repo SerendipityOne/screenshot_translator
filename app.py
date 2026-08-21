@@ -36,8 +36,11 @@ from screenshot_translator.controller import (
     SelectionTranslationThread,
 )
 from screenshot_translator.desktop import (
+    AUTOSTART_DELAY_SECONDS,
     AutostartManager as _AutostartManager,
     quote_desktop_exec_argument,
+    quote_systemd_exec_argument,
+    SYSTEMD_SERVICE_NAME,
 )
 from screenshot_translator.hotkeys import GlobalHotkeys
 from screenshot_translator.services import (
@@ -69,8 +72,17 @@ class AutostartManager(_AutostartManager):
                 QStandardPaths.StandardLocation.GenericConfigLocation
             )
         )
+        try:
+            data_location = QStandardPaths.StandardLocation.GenericDataLocation
+        except AttributeError:
+            # 兼容旧测试替身；真实 Qt 环境始终提供 GenericDataLocation。
+            data_root = config_root
+        else:
+            data_root = Path(QStandardPaths.writableLocation(data_location))
         return super().from_standard_location(
-            Path(__file__).resolve(), config_root=config_root
+            Path(__file__).resolve(),
+            config_root=config_root,
+            data_root=data_root,
         )
 
 
@@ -79,13 +91,16 @@ def main() -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    qt_app = QApplication(sys.argv)
+    service_mode = "--service" in sys.argv
+    qt_args = [argument for argument in sys.argv if argument != "--service"]
+    qt_app = QApplication(qt_args)
     qt_app.setApplicationName(APP_NAME)
     qt_app.setOrganizationName("Local")
     qt_app.setQuitOnLastWindowClosed(False)
     controller = ScreenshotTranslatorApp(
         qt_app,
         source_entrypoint=Path(__file__).resolve(),
+        service_mode=service_mode,
     )
     if not controller.start():
         return 1

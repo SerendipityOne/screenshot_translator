@@ -100,9 +100,11 @@ class ScreenshotTranslatorApp(QObject):
         self,
         qt_app: QApplication,
         source_entrypoint: Path | None = None,
+        service_mode: bool = False,
     ):
         super().__init__()
         self.qt_app = qt_app
+        self.service_mode = service_mode
         self.config_store = ConfigStore.from_standard_location()
         self.autostart_manager = AutostartManager.from_standard_location(
             source_entrypoint
@@ -133,12 +135,15 @@ class ScreenshotTranslatorApp(QObject):
         try:
             self.settings = self.config_store.load()
         except ConfigError as exc:
-            QMessageBox.warning(
-                None,
-                "设置读取失败",
-                f"{exc}\n\n本次启动将使用默认设置，"
-                "可在托盘菜单中重新保存。",
+            message = (
+                f"{exc}；本次启动将使用默认设置，"
+                "可在托盘菜单中重新保存。"
             )
+            if self.service_mode:
+                LOGGER.error("设置读取失败：%s", message)
+                return False
+            else:
+                QMessageBox.warning(None, "设置读取失败", message)
             self.settings = AppConfig()
         try:
             check_tesseract_languages()
@@ -202,6 +207,7 @@ class ScreenshotTranslatorApp(QObject):
             self._apply_settings,
             require_api=require_api,
             initial_tab=initial_tab,
+            autostart_supported=self.autostart_manager.can_enable,
             parent=self.result_window,
         )
         if (
@@ -214,32 +220,49 @@ class ScreenshotTranslatorApp(QObject):
     def _apply_settings(self, config: AppConfig, autostart_enabled: bool) -> None:
         old_config = self.settings
         old_autostart = self.autostart_manager.is_enabled()
-        # 配置文件最后原子落盘；前面的运行时状态失败时均恢复旧值。
+        config_saved = False
+        hotkeys_applied = False
+        autostart_applied = False
         try:
+            # 先原子保存配置；后续运行时步骤失败时可以恢复旧配置，避免
+            # 配置文件已经更新但快捷键或 systemd 服务仍是旧状态。
+            self.config_store.save(config)
+            config_saved = True
             if self.hotkeys is not None:
                 self.hotkeys.reconfigure(
                     config.translate_hotkey,
                     config.ocr_hotkey,
                     config.selection_translate_hotkey,
                 )
-            self.autostart_manager.set_enabled(autostart_enabled)
-            self.config_store.save(config)
+                hotkeys_applied = True
+            if (
+                autostart_enabled != old_autostart
+                or (autostart_enabled and self.autostart_manager.can_enable)
+            ):
+                self.autostart_manager.set_enabled(autostart_enabled)
+                autostart_applied = True
         except Exception as exc:
             LOGGER.warning("设置应用失败，准备恢复旧设置 error=%s", exc)
             rollback_errors: list[str] = []
-            try:
-                self.autostart_manager.set_enabled(old_autostart)
-            except Exception as rollback_exc:
-                rollback_errors.append(f"自启动：{rollback_exc}")
-            try:
-                if self.hotkeys is not None:
+            if autostart_applied:
+                try:
+                    self.autostart_manager.set_enabled(old_autostart)
+                except Exception as rollback_exc:
+                    rollback_errors.append(f"自启动：{rollback_exc}")
+            if hotkeys_applied and self.hotkeys is not None:
+                try:
                     self.hotkeys.reconfigure(
                         old_config.translate_hotkey,
                         old_config.ocr_hotkey,
                         old_config.selection_translate_hotkey,
                     )
-            except Exception as rollback_exc:
-                rollback_errors.append(f"快捷键：{rollback_exc}")
+                except Exception as rollback_exc:
+                    rollback_errors.append(f"快捷键：{rollback_exc}")
+            if config_saved:
+                try:
+                    self.config_store.save(old_config)
+                except Exception as rollback_exc:
+                    rollback_errors.append(f"配置：{rollback_exc}")
             if rollback_errors:
                 LOGGER.exception("设置保存失败且回滚不完整")
                 raise ConfigError(
@@ -402,6 +425,7 @@ class ScreenshotTranslatorApp(QObject):
                 title, message, QSystemTrayIcon.MessageIcon.Information, 3000
             )
 
-    @staticmethod
-    def _critical(title: str, message: str) -> None:
-        QMessageBox.critical(None, title, message)
+    def _critical(self, title: str, message: str) -> None:
+        LOGGER.error("%s：%s", title, message)
+        if not self.service_mode:
+            QMessageBox.critical(None, title, message)

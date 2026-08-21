@@ -201,16 +201,25 @@ class SettingsDialog(QDialog):
         require_api: bool = False,
         initial_tab: int = 0,
         parent: QWidget | None = None,
+        autostart_supported: bool = True,
     ):
         super().__init__(parent)
         self.apply_settings = apply_settings
         self.require_api = require_api
+        self.autostart_supported = autostart_supported
         self.saved_config: AppConfig | None = None
         self.setWindowTitle("设置")
         self.setMinimumSize(620, 360)
 
-        self.autostart = QCheckBox("登录 GNOME 后自动启动（仅 X11）")
+        self.autostart = QCheckBox(
+            "登录 GNOME 后由 systemd 用户服务自动启动（延迟 8 秒）"
+        )
         self.autostart.setChecked(autostart_enabled)
+        self.autostart.setEnabled(autostart_supported or autostart_enabled)
+        if not autostart_supported:
+            self.autostart.setToolTip(
+                "源码开发模式不能启用自启动，请运行独立应用后启用。"
+            )
         self.translate_hotkey = QKeySequenceEdit()
         self.translate_hotkey.setMaximumSequenceLength(1)
         self.translate_hotkey.setKeySequence(QKeySequence(config.translate_hotkey))
@@ -228,6 +237,13 @@ class SettingsDialog(QDialog):
             "主键支持字母、数字和 F1-F12。"
         )
         general_notice.setWordWrap(True)
+        autostart_notice = QLabel(
+            "自启动只在 GNOME X11 图形登录后生效；"
+            "独立应用会安装到固定用户目录，服务日志可用 journalctl 查看。"
+            if autostart_supported
+            else "当前是源码开发模式，不能启用 systemd 自启动；如已有服务，可取消勾选后清理。"
+        )
+        autostart_notice.setWordWrap(True)
         general_form = QFormLayout()
         general_form.addRow("截图翻译快捷键：", self.translate_hotkey)
         general_form.addRow("截图 OCR 快捷键：", self.ocr_hotkey)
@@ -235,6 +251,7 @@ class SettingsDialog(QDialog):
         general_tab = QWidget()
         general_layout = QVBoxLayout(general_tab)
         general_layout.addWidget(self.autostart)
+        general_layout.addWidget(autostart_notice)
         general_layout.addLayout(general_form)
         general_layout.addWidget(general_notice)
         general_layout.addStretch()
